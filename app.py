@@ -1,0 +1,229 @@
+"""Skin-lesion analysis: upload -> U-Net lesion mask -> melanoma classifier (MelaNet) -> dashboard.
+
+Run:  python app.py   (then open http://<server-ip>:7860 from a laptop or phone on the same Wi-Fi)
+Research prototype only: not a medical device, not a diagnosis.
+"""
+import json
+import os
+import threading
+import time
+from pathlib import Path
+
+import gradio as gr
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from PIL import Image, ImageOps
+
+import classifier
+
+# ----------------------------------------------------------------- config
+IMG_SIZE = 256  # must match the input size your U-Net was trained with
+UNET_PATH = Path("weights/unet.keras")         # your U-Net
+SEG_JSON, CLS_JSON = Path("metrics/seg_metrics.json"), Path("metrics/cls_metrics.json")
+DEFAULT_THRESHOLD = 0.5   # P(malignant) >= threshold -> 'malignant'; adjustable in the UI
+
+# ----------------------------------------------------------------- models
+def _load_unet(path):
+    # compile=False: inference only, so the custom composite loss/metrics are not needed.
+    # If your model uses custom *layers*, pass custom_objects={"LayerName": LayerClass}.
+    try:
+        return tf.keras.models.load_model(path, compile=False)
+    except (OSError, ValueError) as e:
+        print(f"[not loaded] {path}: {e}")
+        return None
+
+
+unet = _load_unet(UNET_PATH)  # None -> demo mask, so the network/dashboard parts can still be tested
+clf = None
+try:
+    clf = classifier.Classifier()
+except Exception as e:  # offline (first run downloads the weights), corrupt file ...
+    print(f"[classifier not loaded] {e}")
+clf_ft = None  # MelaNet fine-tuned on U-Net lesion crops (finetune_classifier.py); used for the crop if it exists
+if clf is not None and classifier.FINETUNED.exists():
+    try:
+        clf_ft = classifier.Classifier(classifier.FINETUNED)
+    except Exception as e:
+        print(f"[fine-tuned classifier not loaded] {e}")
+
+
+def analyse(img: np.ndarray, use_mask=True, classify=True):
+    """img: HxWx3 uint8 -> lesion mask (256x256 bool), resized RGB, P(malignant) on the original image and,
+    if use_mask, on a crop around the U-Net lesion (fine-tuned model if available). None if no classifier."""
+    t0 = time.perf_counter()
+    img = img[..., :3]
+    x = tf.image.resize(img, (IMG_SIZE, IMG_SIZE)).numpy()[None] / 255.0  # (1,H,W,3) in [0,1]
+    if unet is None:  # demo stub so the client-server stack can be tested before the model exists
+        mask = (x.mean(-1, keepdims=True) < x.mean()).astype(np.float32)
+    else:
+        mask = (unet(x, training=False).numpy() > 0.5).astype(np.float32)          # sigmoid output assumed
+    m = mask[0, ..., 0].astype(bool)
+    out = {"mask": m, "rgb": (x[0] * 255).astype(np.uint8), "p_orig": None, "p_mask": None}
+
+    t1 = time.perf_counter()
+    if clf is not None and classify:
+        pil = Image.fromarray(img)
+        out["p_orig"] = clf(pil)
+        if use_mask:  # square crop of the original image around the U-Net lesion mask
+            out["p_mask"] = (clf_ft or clf)(classifier.crop_lesion(pil, m))
+    out["ms_seg"], out["ms_cls"] = 1000 * (t1 - t0), 1000 * (time.perf_counter() - t1)
+    return out
+
+
+def run_pipeline(img: np.ndarray, threshold=DEFAULT_THRESHOLD, use_mask=True):
+    """Returns mask, overlay, decision text (original), decision text (lesion crop), details table."""
+    r = analyse(img, use_mask)
+    m = r["mask"]
+    overlay = r["rgb"].copy()
+    overlay[m] = (0.5 * overlay[m] + 0.5 * np.array([255, 0, 0])).astype(np.uint8)
+
+    def show(p):  # decision at the chosen threshold, with the probability behind it
+        if clf is None:
+            return "classifier not loaded"
+        if p is None:
+            return "not requested"
+        return f"{'MALIGNANT' if p >= threshold else 'benign'}   (P(malignant) = {p:.3f}, threshold {threshold})"
+
+    details = pd.DataFrame([
+        ("Lesion area (% of image)", round(100 * m.mean(), 2)),
+        ("Segmentation time (ms)", round(r["ms_seg"], 1)),
+        ("Classification time (ms)", round(r["ms_cls"], 1)),
+        ("Lesion-crop classifier", "fine-tuned MelaNet" if clf_ft else "MelaNet (not fine-tuned)"),
+    ], columns=["Metric", "Value"]).astype(str)
+    return (m * 255).astype(np.uint8), overlay, show(r["p_orig"]), show(r["p_mask"]), details
+
+
+# ----------------------------------------------------------------- request log (network metrics)
+# One row per request: (timestamp, latency_s, success, client_ip, upload_bytes). Kept for the whole run.
+LOG, LOCK = [], threading.Lock()
+STATE = {"active": 0, "peak": 0}   # requests currently in flight / highest seen at once
+START = time.time()
+
+
+def predict(img_path, threshold, use_mask, request: gr.Request):
+    """API endpoint: called by the browser UI or by any gradio_client."""
+    t0, ok, size = time.perf_counter(), False, 0
+    with LOCK:
+        STATE["active"] += 1
+        STATE["peak"] = max(STATE["peak"], STATE["active"])
+    try:
+        if img_path is None:
+            raise gr.Error("Upload a skin-lesion image first.")
+        size = os.path.getsize(img_path)  # real bytes received over the network
+        img = np.array(ImageOps.exif_transpose(Image.open(img_path)).convert("RGB"))
+        out = run_pipeline(img, threshold, use_mask)
+        ok = True
+        return out
+    finally:
+        with LOCK:
+            STATE["active"] -= 1
+            LOG.append((time.time(), time.perf_counter() - t0, ok, request.client.host if request else "?", size))
+
+
+def reset_stats():
+    global START
+    with LOCK:
+        LOG.clear()
+        STATE["peak"] = STATE["active"]
+        START = time.time()
+
+
+def network_view():
+    now = time.time()
+    with LOCK:
+        df = pd.DataFrame(LOG, columns=["t", "latency", "ok", "client", "bytes"]).astype(
+            {"t": float, "latency": float, "ok": bool, "client": str, "bytes": float})
+        active, peak = STATE["active"], STATE["peak"]
+    n, good = len(df), df[df.ok]
+    s = (good.latency * 1000).describe(percentiles=[.5, .95, .99]).fillna(0)  # latency of successful requests
+    busy = df.t.max() - df.t.min() if n > 1 else 0                            # first -> last request
+    r = lambda v, d=1: round(float(np.nan_to_num(v)), d)
+
+    rows = [
+        ("Reliability", "Total requests", n),
+        ("Reliability", "Failed requests", n - len(good)),
+        ("Reliability", "Success rate (%)", r(100 * len(good) / n) if n else 0),
+        ("Latency", "Average (ms)", r(s["mean"])),
+        ("Latency", "Median (ms)", r(s["50%"])),
+        ("Latency", "P95 (ms)", r(s["95%"])),
+        ("Latency", "P99 (ms)", r(s["99%"])),
+        ("Latency", "Min (ms)", r(s["min"])),
+        ("Latency", "Max (ms)", r(s["max"])),
+        ("Latency", "Jitter, std dev (ms)", r(s["std"])),
+        ("Throughput", "Average (req/s)", r((n - 1) / busy, 2) if busy > 0 else 0),
+        ("Throughput", "Peak, best 1 s (req/s)", int(df.t.astype(int).value_counts().max()) if n else 0),
+        ("Clients", "Active (last 60 s)", df[df.t > now - 60].client.nunique()),
+        ("Clients", "Total unique", df.client.nunique()),
+        ("Load", "In-flight requests now", active),
+        ("Load", "Peak concurrent requests", peak),
+        ("Data", "Total received (MB)", r(df.bytes.sum() / 1e6, 2)),
+        ("Data", "Avg upload size (KB)", r(df.bytes[df.bytes > 0].mean() / 1e3)),
+        ("Server", "Uptime (min)", r((now - START) / 60)),
+    ]
+    summary = pd.DataFrame([(g, k, str(v)) for g, k, v in rows], columns=["Group", "Metric", "Value"])
+
+    by = df.groupby("client").agg(Requests=("ok", "size"), Success=("ok", "mean"), Data=("bytes", "sum"))
+    clients = pd.DataFrame({"Client IP": by.index, "Requests": by.Requests,
+                            "Success rate (%)": (by.Success * 100).round(1),
+                            "Avg latency (ms)": (good.groupby("client").latency.mean().reindex(by.index) * 1000).round(1).fillna(0),
+                            "Data (KB)": (by.Data / 1e3).round(1)})
+
+    plot = pd.DataFrame({"request": range(1, n + 1), "latency_ms": df.latency * 1000}).tail(200)
+    return summary, clients, plot
+
+
+# ----------------------------------------------------------------- dashboard (static metrics from offline evaluation)
+def _json(path):
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def static_metrics():
+    table = lambda p: pd.DataFrame(list(_json(p).items()), columns=["Metric", "Value"])
+    return table(SEG_JSON), table(CLS_JSON)
+
+
+# ----------------------------------------------------------------- UI
+with gr.Blocks(title="Skin Lesion Analysis") as demo:
+    gr.Markdown("# Skin lesion segmentation and melanoma classification")
+
+    with gr.Tab("Analyse"):
+        gr.Markdown("Research prototype for a student project. Not a medical device; the output is not a diagnosis.")
+        with gr.Row():
+            inp = gr.Image(type="filepath", label="Skin-lesion image", sources=["upload", "webcam"])
+            with gr.Column():
+                op = gr.Slider(0.05, 0.95, value=DEFAULT_THRESHOLD, step=0.01, label="Decision threshold: malignant if P(malignant) is at least this")
+                use_mask = gr.Checkbox(True, label="Also classify the U-Net lesion crop (shows what the segmentation adds)")
+                details = gr.Dataframe(label="Details")
+        with gr.Row():
+            mask_out = gr.Image(label="Lesion mask")
+            overlay_out = gr.Image(label="Overlay")
+        with gr.Row():
+            label_orig = gr.Textbox(label="Classifier: original image", interactive=False)
+            label_mask = gr.Textbox(label="Classifier: U-Net lesion crop", interactive=False)
+        gr.Button("Analyse", variant="primary").click(
+            predict, [inp, op, use_mask], [mask_out, overlay_out, label_orig, label_mask, details], api_name="predict")
+
+    with gr.Tab("Network"):
+        gr.Markdown("### Network metrics (cumulative since server start or last reset)")
+        net_df = gr.Dataframe()
+        gr.Markdown("**Per client**")
+        client_df = gr.Dataframe()
+        lat_plot = gr.LinePlot(x="request", y="latency_ms", title="Server latency, last 200 requests (ms)")
+        reset = gr.Button("Reset network statistics")
+
+        net_out = [net_df, client_df, lat_plot]
+        demo.load(network_view, None, net_out)
+        gr.Timer(2).tick(network_view, None, net_out)   # redraws the table; values are cumulative, not windowed
+        reset.click(reset_stats).then(network_view, None, net_out)
+
+    with gr.Tab("Evaluation"):
+        gr.Markdown("### Segmentation metrics")
+        seg_df = gr.Dataframe()
+        gr.Markdown("### Classification metrics (original image vs U-Net lesion variants)")
+        cls_df = gr.Dataframe()
+        demo.load(static_metrics, None, [seg_df, cls_df])
+
+if __name__ == "__main__":
+    # 0.0.0.0 makes the server reachable from other devices on the same Wi-Fi
+    demo.queue(default_concurrency_limit=2).launch(server_name="0.0.0.0", server_port=7860, show_error=True)
