@@ -47,38 +47,62 @@ if clf is not None and classifier.FINETUNED.exists():
     except Exception as e:
         print(f"[fine-tuned classifier not loaded] {e}")
 
+def _pad_to_square(img: np.ndarray):
+    """Pads HxWx3 image to a square (S, S, 3) and returns (padded_img, (top, left, h, w, s))."""
+    h, w = img.shape[:2]
+    s = max(h, w)
+    top = (s - h) // 2
+    left = (s - w) // 2
+    sq = np.zeros((s, s, img.shape[2]), dtype=img.dtype)
+    sq[top:top + h, left:left + w] = img
+    return sq, (top, left, h, w, s)
+
+
+def _unpad_mask(mask_256: np.ndarray, pad_info) -> np.ndarray:
+    """Resizes 256x256 square mask back to original (H, W) bool mask without distortion."""
+    top, left, h, w, s = pad_info
+    mask_u8 = (mask_256.astype(np.uint8)) * 255
+    sq_mask = Image.fromarray(mask_u8, mode="L").resize((s, s), resample=Image.Resampling.NEAREST)
+    orig_mask = sq_mask.crop((left, top, left + w, top + h))
+    return np.array(orig_mask) > 127
+
 
 def analyse(img: np.ndarray, use_mask=True, classify=True):
-    """img: HxWx3 uint8 -> lesion mask (256x256 bool), resized RGB, P(malignant) on the original image and,
-    if use_mask, on a crop around the U-Net lesion (fine-tuned model if available). None if no classifier."""
+    """img: HxWx3 uint8 -> original-resolution bool mask (HxW), P(malignant) on original & lesion crop."""
     t0 = time.perf_counter()
     img = img[..., :3]
-    x = tf.image.resize(img, (IMG_SIZE, IMG_SIZE)).numpy()[None] / 255.0  # (1,H,W,3) in [0,1]
-    if unet is None:  # demo stub so the client-server stack can be tested before the model exists
-        mask = (x.mean(-1, keepdims=True) < x.mean()).astype(np.float32)
-    else:
-        mask = (unet(x, training=False).numpy() > 0.5).astype(np.float32)          # sigmoid output assumed
-    m = mask[0, ..., 0].astype(bool)
-    out = {"mask": m, "rgb": (x[0] * 255).astype(np.uint8), "p_orig": None, "p_mask": None}
+    sq_img, pad_info = _pad_to_square(img)
+    x = tf.image.resize(sq_img, (IMG_SIZE, IMG_SIZE)).numpy()[None] / 255.0  # (1, 256, 256, 3)
 
+    if unet is None:  # demo stub so the client-server stack can be tested before the model exists
+        mask_256 = (x.mean(-1, keepdims=True) < x.mean())[0, ..., 0].numpy()
+    else:
+        mask_256 = (unet(x, training=False).numpy() > 0.5)[0, ..., 0]
+
+    m = _unpad_mask(mask_256, pad_info)  # exact (H, W) matching original image
     t1 = time.perf_counter()
+
+    out = {"mask": m, "p_orig": None, "p_mask": None}
     if clf is not None and classify:
         pil = Image.fromarray(img)
         out["p_orig"] = clf(pil)
-        if use_mask:  # square crop of the original image around the U-Net lesion mask
+        if use_mask and m.any():  # crop original image using exact-resolution mask
             out["p_mask"] = (clf_ft or clf)(classifier.crop_lesion(pil, m))
-    out["ms_seg"], out["ms_cls"] = 1000 * (t1 - t0), 1000 * (time.perf_counter() - t1)
+
+    out["ms_seg"] = 1000 * (t1 - t0)
+    out["ms_cls"] = 1000 * (time.perf_counter() - t1)
     return out
 
 
 def run_pipeline(img: np.ndarray, threshold=DEFAULT_THRESHOLD, use_mask=True):
-    """Returns mask, overlay, decision text (original), decision text (lesion crop), details table."""
+    """Returns full-res mask, full-res overlay, decision text (original), decision text (lesion crop), details table."""
     r = analyse(img, use_mask)
     m = r["mask"]
-    overlay = r["rgb"].copy()
-    overlay[m] = (0.5 * overlay[m] + 0.5 * np.array([255, 0, 0])).astype(np.uint8)
+    overlay = img[..., :3].copy()
+    if m.any():
+        overlay[m] = (0.5 * overlay[m] + 0.5 * np.array([255, 0, 0])).astype(np.uint8)
 
-    def show(p):  # decision at the chosen threshold, with the probability behind it
+    def show(p):
         if clf is None:
             return "classifier not loaded"
         if p is None:
@@ -91,7 +115,7 @@ def run_pipeline(img: np.ndarray, threshold=DEFAULT_THRESHOLD, use_mask=True):
         ("Classification time (ms)", round(r["ms_cls"], 1)),
         ("Lesion-crop classifier", "fine-tuned MelaNet" if clf_ft else "MelaNet (not fine-tuned)"),
     ], columns=["Metric", "Value"]).astype(str)
-    return (m * 255).astype(np.uint8), overlay, show(r["p_orig"]), show(r["p_mask"]), details
+    return (m.astype(np.uint8) * 255), overlay, show(r["p_orig"]), show(r["p_mask"]), details
 
 
 # ----------------------------------------------------------------- request log (network metrics)
@@ -185,7 +209,7 @@ def static_metrics():
 
 # ----------------------------------------------------------------- UI
 with gr.Blocks(title="Skin Lesion Analysis") as demo:
-    gr.Markdown("# Skin lesion segmentation and melanoma classification")
+    gr.Markdown("# Akriti")
 
     with gr.Tab("Analyse"):
         gr.Markdown("Research prototype for a student project. Not a medical device; the output is not a diagnosis.")
